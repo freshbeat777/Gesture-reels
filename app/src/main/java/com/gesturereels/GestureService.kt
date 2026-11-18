@@ -35,10 +35,7 @@ class GestureService : LifecycleService() {
         private const val WINDOW_MS = 400L      // time window to measure a flick
         private const val THRESH = 0.35f        // how far the fingertip must move (in palm lengths)
         private const val COOLDOWN_MS = 400L    // minimum pause between swipes
-        private const val HAND_WINDOW_MS = 500L   // time window for a whole-hand swipe
-        private const val HAND_THRESH = 0.9f      // how far the hand must move down (in palm lengths)
-        private const val HAND_COOLDOWN_MS = 900L // pause after a hand swipe
-        private const val REARM_DELTA = 0.3f      // finger must curl back down by this much to allow the next swipe
+        private const val REARM_DELTA = 0.3f      // finger must curl back by this much to allow the next swipe
         private const val REARM_TIMEOUT_MS = 1500L // ...or this much time must pass
         private const val DEBUG = true            // show small status messages (set false to hide)
     }
@@ -48,10 +45,9 @@ class GestureService : LifecycleService() {
     private val history = ArrayDeque<Pair<Long, Float>>()
     private var lastTrigger = 0L
     private var armed = true
-    private var minD = 10f
+    private var extremeD = 0f
+    private var lastWasDown = false
     private var lastDebug = 0L
-    private val handHistory = ArrayDeque<Pair<Long, Float>>()
-    private var lastHandTrigger = 0L
     private val ui = Handler(Looper.getMainLooper())
     private var toast: Toast? = null
     private var handSeen = false
@@ -159,7 +155,6 @@ class GestureService : LifecycleService() {
             if (handSeen && DEBUG) say("Hand lost")
             handSeen = false
             history.clear()
-            handHistory.clear()
             return
         }
         if (!handSeen && DEBUG) say("Hand detected")
@@ -172,19 +167,6 @@ class GestureService : LifecycleService() {
             (hand[9].y() - hand[0].y()) * h
         )
         if (palm < 1f) return
-        // Whole-hand swipe down -> previous reel
-        val cy = (hand[0].y() + hand[5].y() + hand[9].y() + hand[17].y()) / 4f * h
-        handHistory.addLast(now to cy)
-        while (handHistory.isNotEmpty() && now - handHistory.first().first > HAND_WINDOW_MS) handHistory.removeFirst()
-        val handDy = (cy - handHistory.first().second) / palm
-        if (handDy > HAND_THRESH && now - lastHandTrigger > HAND_COOLDOWN_MS) {
-            lastHandTrigger = now
-            handHistory.clear()
-            history.clear()
-            if (DEBUG) say("PREVIOUS (hand down)")
-            SwipeAccessibilityService.swipe(false)
-            return
-        }
 
         // How far the fingertip is above(-) / below(+) its knuckle, in palm lengths
         val d = (hand[8].y() - hand[5].y()) * h / palm
@@ -194,30 +176,42 @@ class GestureService : LifecycleService() {
         val delta = d - history.first().second
         if (abs(delta) > maxMove) maxMove = abs(delta)
 
-        // After a swipe, wait for the finger to curl back down before allowing the next one.
+        // After a flick, wait for the finger to return from that same direction before allowing another trigger.
         if (DEBUG && now - lastDebug > 2500) {
             say("d=%.2f move=%.2f armed=%b".format(d, maxMove, armed))
             maxMove = 0f
             lastDebug = now
         }
         if (!armed) {
-            if (d < minD) minD = d
-            if (d - minD > REARM_DELTA || now - lastTrigger > REARM_TIMEOUT_MS) {
-                armed = true
-                history.clear()
+            if (lastWasDown) {
+                // last trigger was a DOWN flick; wait for the finger to curl back UP
+                if (d > extremeD) extremeD = d
+                if (extremeD - d > REARM_DELTA || now - lastTrigger > REARM_TIMEOUT_MS) {
+                    armed = true
+                    history.clear()
+                }
+            } else {
+                // last trigger was an UP flick; wait for the finger to curl back DOWN
+                if (d < extremeD) extremeD = d
+                if (d - extremeD > REARM_DELTA || now - lastTrigger > REARM_TIMEOUT_MS) {
+                    armed = true
+                    history.clear()
+                }
             }
             return
         }
         if (now - lastTrigger < COOLDOWN_MS || history.size < 2) return
-        if (delta < -THRESH) fire(true, now)       // finger flicked up -> next reel
+        if (delta < -THRESH) fire(true, now, d)         // finger flicked up -> next reel
+        else if (delta > THRESH) fire(false, now, d)    // finger flicked down -> previous reel
     }
 
-    private fun fire(next: Boolean, now: Long) {
+    private fun fire(next: Boolean, now: Long, d: Float) {
         lastTrigger = now
         armed = false
-        minD = 10f
+        lastWasDown = !next
+        extremeD = d
         history.clear()
-        if (DEBUG) say("NEXT")
+        if (DEBUG) say(if (next) "NEXT" else "PREVIOUS")
         SwipeAccessibilityService.swipe(next)
     }
 
