@@ -7,6 +7,7 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.Matrix
+import android.graphics.drawable.GradientDrawable
 import android.graphics.PixelFormat
 import android.os.Build
 import android.os.Handler
@@ -15,6 +16,7 @@ import android.os.SystemClock
 import android.provider.Settings
 import android.util.Log
 import android.view.Gravity
+import android.view.View
 import android.view.WindowManager
 import android.widget.TextView
 import android.widget.Toast
@@ -32,7 +34,13 @@ import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import java.util.concurrent.Executors
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.hypot
+import kotlin.math.max
+import kotlin.math.min
+import kotlin.math.sin
 
 class GestureService : LifecycleService() {
 
@@ -55,24 +63,27 @@ class GestureService : LifecycleService() {
         private const val CLOSED_FINGER_COUNT = 1 // this many or fewer extended = fist / closed, resets the arming
 
         // --- Eyes closed -> toggle cursor ---
-        private const val EYE_CLOSED_THRESH = 0.5f   // 0 = open, 1 = fully closed (MediaPipe blink score)
         private const val EYES_CLOSED_HOLD_MS = 4000L // how long eyes must stay closed to toggle the cursor
 
         // --- Double blink -> click ---
-        private const val BLINK_MIN_MS = 80L    // ignore flicker shorter than this
-        private const val BLINK_MAX_MS = 500L   // a closure longer than this is a hold, not a blink
-        private const val DOUBLE_BLINK_WINDOW_MS = 700L // two blinks within this window = a click
+        private const val BLINK_MIN_MS = 50L     // ignore flicker shorter than this
+        private const val BLINK_MAX_MS = 500L    // a closure longer than this is a hold, not a blink
+        private const val DOUBLE_BLINK_WINDOW_MS = 800L // two blinks within this window = a click
+        private const val BLINK_FREEZE_SCORE = 0.25f    // eyelids this closed => cursor freezes (no jitter / wrong click spot)
+        private const val POST_BLINK_FREEZE_MS = 150L   // cursor stays frozen briefly after eyes reopen
 
         // --- Head movement -> cursor movement ---
-        // How far the cursor moves (as a fraction of screen size) per unit of head movement.
-        // Higher = more sensitive / cursor moves farther for the same head motion.
-        private const val CURSOR_SENSITIVITY = 3.0f
-        // If moving your head left moves the cursor right (or vice versa), flip this to true.
+        // If moving your head left moves the cursor right (or vice versa), flip this.
         private const val MIRROR_CURSOR_X = true
+        private const val CURSOR_Y_GAIN = 1.25f   // vertical head motion is smaller, so boost it a little
+        private const val DEAD_ZONE = 0.008f      // tiny head tremor below this is ignored
+        private const val CALIB_FRAMES = 8        // frames averaged to find your "center" when the cursor appears
+        private const val ONE_EURO_BETA = 6f      // how quickly smoothing relaxes during fast head moves
+        private const val CURSOR_SIZE_DP = 30
 
         // --- Performance ---
         private const val MAX_DIM = 480        // longest edge (px) fed to the ML models; smaller = faster
-        private const val FACE_INTERVAL_MS = 100L // ~10fps cap on the face model (hand still runs every frame)
+        private const val FACE_INTERVAL_MS = 30L // face model runs about every frame (blinks are very short)
 
         private const val DEBUG = true // show small status messages (set false to hide)
     }
@@ -87,20 +98,38 @@ class GestureService : LifecycleService() {
     private var handSeen = false
 
     // Eyes-closed-hold / cursor show-hide state
-    private var eyesClosedSince = 0L
+    private var eyesClosedNow = false
+    private var closeStart = 0L
     private var closureHandled = false
-    private var cursorView: TextView? = null
+    @Volatile private var cursorView: View? = null
     private var windowManager: WindowManager? = null
 
-    // Double-blink click state
-    private val blinkTimes = ArrayDeque<Long>()
+    // Double-blink click state: (time, anchorX, anchorY) of each recent blink
+    private val blinkEvents = ArrayDeque<Triple<Long, Float, Float>>()
+    private var pendingAnchorX = 0f
+    private var pendingAnchorY = 0f
+    private var freezeUntil = 0L
 
     // Head-controlled cursor state
-    private var cursorCalibrated = false
+    @Volatile private var cursorCalibrated = false
+    private var calibCount = 0
+    private var calibSumYaw = 0f
+    private var calibSumPitch = 0f
     private var baseYaw = 0f
     private var basePitch = 0f
-    private var cursorX = 0f
-    private var cursorY = 0f
+    @Volatile private var cursorX = 0f
+    @Volatile private var cursorY = 0f
+    private var lastStableX = 0f
+    private var lastStableY = 0f
+    private val yawFilter = OneEuroFilter({ smoothCutoff() }, ONE_EURO_BETA)
+    private val pitchFilter = OneEuroFilter({ smoothCutoff() }, ONE_EURO_BETA)
+
+    // Live settings (changed from the app screen, applied instantly)
+    private val prefs by lazy { getSharedPreferences("cfg", MODE_PRIVATE) }
+    private fun cursorSpeed() = 1f + prefs.getInt("speed", 20) / 10f
+    private fun smoothCutoff() = 3.0f - prefs.getInt("smooth", 6) * 0.27f
+    private fun blinkCloseThreshold() = 0.75f - prefs.getInt("blink", 20) / 100f
+    private fun pauseHandInCursor() = prefs.getBoolean("pause_hand", false)
 
     // Finger flick (up -> next) state
     private val fingerHistory = ArrayDeque<Pair<Long, Float>>()
@@ -252,6 +281,12 @@ class GestureService : LifecycleService() {
     private fun onHandResult(result: HandLandmarkerResult) {
         val hand = result.landmarks().firstOrNull()
         val now = SystemClock.uptimeMillis()
+        if (cursorView != null && pauseHandInCursor()) {
+            fingerHistory.clear()
+            palmArmed = true
+            handSeen = false
+            return
+        }
         if (hand == null) {
             if (handSeen && DEBUG) say("Hand lost")
             handSeen = false
@@ -331,82 +366,152 @@ class GestureService : LifecycleService() {
         SwipeAccessibilityService.swipe(true)
     }
 
+    private fun resetFaceState() {
+        eyesClosedNow = false
+        closureHandled = false
+        blinkEvents.clear()
+        cursorCalibrated = false
+        calibCount = 0
+        calibSumYaw = 0f
+        calibSumPitch = 0f
+        yawFilter.reset()
+        pitchFilter.reset()
+    }
+
+    private fun deadZone(v: Float): Float {
+        val a = abs(v)
+        return if (a < DEAD_ZONE) 0f else (a - DEAD_ZONE) * (if (v < 0f) -1f else 1f)
+    }
+
     private fun onFaceResult(result: FaceLandmarkerResult) {
         val face = result.faceLandmarks().firstOrNull()
         val now = SystemClock.uptimeMillis()
         if (face == null) {
-            eyesClosedSince = 0L
-            closureHandled = false
-            cursorCalibrated = false
+            resetFaceState()
             return
         }
+        val dm = resources.displayMetrics
+        val screenW = dm.widthPixels.toFloat()
+        val screenH = dm.heightPixels.toFloat()
+        val w = imgW
+        val h = imgH
 
-        // 1 = nose tip, 10 = forehead, 152 = chin, 234 = right cheek, 454 = left cheek
-        val nose = face[1]
-        val forehead = face[10]
-        val chin = face[152]
-        val rightCheek = face[234]
-        val leftCheek = face[454]
-        val faceH = kotlin.math.abs(chin.y() - forehead.y())
-        val faceW = kotlin.math.abs(leftCheek.x() - rightCheek.x())
-        val havePose = faceH > 0.01f && faceW > 0.01f
-        val pitchD = if (havePose) (nose.y() - (forehead.y() + chin.y()) / 2f) / faceH else 0f
-        val yawD = if (havePose) (nose.x() - (leftCheek.x() + rightCheek.x()) / 2f) / faceW else 0f
-
-        var eyesClosed = false
-        val blendshapesList = result.faceBlendshapes()
-        if (blendshapesList.isPresent && blendshapesList.get().isNotEmpty()) {
-            var blinkL = 0f
-            var blinkR = 0f
-            for (c in blendshapesList.get()[0]) {
+        // ---------- Eye blink scores, with hysteresis (no flicker around the threshold) ----------
+        var blinkL = 0f
+        var blinkR = 0f
+        val shapes = result.faceBlendshapes()
+        if (shapes.isPresent && shapes.get().isNotEmpty()) {
+            for (c in shapes.get()[0]) {
                 when (c.categoryName()) {
                     "eyeBlinkLeft" -> blinkL = c.score()
                     "eyeBlinkRight" -> blinkR = c.score()
                 }
             }
-            eyesClosed = (blinkL + blinkR) / 2f > EYE_CLOSED_THRESH
+        }
+        val lo = min(blinkL, blinkR)
+        val hi = max(blinkL, blinkR)
+        val avg = (blinkL + blinkR) / 2f
+        val closeT = blinkCloseThreshold()
+        val openT = (closeT - 0.2f).coerceAtLeast(0.15f)
+        val wasClosed = eyesClosedNow
+        if (!eyesClosedNow && lo > closeT) {
+            eyesClosedNow = true      // BOTH eyes must close (a wink or squint is ignored)
+        } else if (eyesClosedNow && hi < openT) {
+            eyesClosedNow = false
         }
 
-        // ---- Long hold (>= 4s) -> show/hide cursor; short closures -> blink, 2 quick ones -> click ----
-        if (eyesClosed) {
-            if (eyesClosedSince == 0L) eyesClosedSince = now
-            if (!closureHandled && now - eyesClosedSince >= EYES_CLOSED_HOLD_MS) {
-                closureHandled = true
-                ui.post { toggleCursor() }
+        // ---------- Head pose from landmarks, corrected for head roll (sideways tilt) ----------
+        // 1 = nose tip, 10 = forehead, 152 = chin, 234/454 = cheeks, 33/263 = outer eye corners
+        val nose = face[1]
+        val forehead = face[10]
+        val chin = face[152]
+        val rightCheek = face[234]
+        val leftCheek = face[454]
+        val faceWpx = hypot((leftCheek.x() - rightCheek.x()) * w, (leftCheek.y() - rightCheek.y()) * h)
+        val faceHpx = hypot((chin.x() - forehead.x()) * w, (chin.y() - forehead.y()) * h)
+        val havePose = faceWpx > 1f && faceHpx > 1f
+        var yawF = 0f
+        var pitchF = 0f
+        if (havePose) {
+            val midX = (leftCheek.x() + rightCheek.x()) / 2f
+            val midY = (forehead.y() + chin.y()) / 2f
+            val dx = (nose.x() - midX) * w
+            val dy = (nose.y() - midY) * h
+            val roll = atan2((face[263].y() - face[33].y()) * h, (face[263].x() - face[33].x()) * w)
+            val cr = cos(roll)
+            val sr = sin(roll)
+            val rx = dx * cr + dy * sr
+            val ry = -dx * sr + dy * cr
+            // One-Euro filter: smooth when the head is still, responsive when it moves fast
+            yawF = yawFilter.filter(rx / faceWpx, now)
+            pitchF = pitchFilter.filter(ry / faceHpx, now)
+        }
+
+        // ---------- Blink state machine ----------
+        if (eyesClosedNow && !wasClosed) {
+            closeStart = now
+            closureHandled = false
+            // The click spot = where the cursor was BEFORE the eyelids started to move
+            pendingAnchorX = lastStableX
+            pendingAnchorY = lastStableY
+        }
+        if (eyesClosedNow && !closureHandled && now - closeStart >= EYES_CLOSED_HOLD_MS) {
+            closureHandled = true
+            blinkEvents.clear()
+            ui.post { toggleCursor() }
+        }
+        if (!eyesClosedNow && wasClosed) {
+            freezeUntil = now + POST_BLINK_FREEZE_MS
+            val dur = now - closeStart
+            if (!closureHandled && dur in BLINK_MIN_MS..BLINK_MAX_MS) {
+                blinkEvents.addLast(Triple(now, pendingAnchorX, pendingAnchorY))
             }
-        } else {
-            if (eyesClosedSince != 0L) {
-                val closedFor = now - eyesClosedSince
-                if (closedFor in BLINK_MIN_MS..BLINK_MAX_MS) {
-                    blinkTimes.addLast(now)
-                }
-            }
-            eyesClosedSince = 0L
             closureHandled = false
         }
-        while (blinkTimes.isNotEmpty() && now - blinkTimes.first() > DOUBLE_BLINK_WINDOW_MS) blinkTimes.removeFirst()
-        if (blinkTimes.size >= 2) {
-            blinkTimes.clear()
-            if (cursorView != null) ui.post { clickAtCursor() }
+        while (blinkEvents.isNotEmpty() && now - blinkEvents.first().first > DOUBLE_BLINK_WINDOW_MS) {
+            blinkEvents.removeFirst()
+        }
+        if (blinkEvents.size >= 2) {
+            val first = blinkEvents.first()
+            blinkEvents.clear()
+            if (cursorView != null) ui.post { clickAt(first.second, first.third) }
         }
 
-        // ---- Head movement -> cursor movement (only while the cursor is showing) ----
-        if (havePose && cursorView != null) {
+        // ---------- Head -> cursor (frozen while the eyes are closing / closed / just reopened) ----------
+        val frozen = eyesClosedNow || avg > BLINK_FREEZE_SCORE || now < freezeUntil
+        if (cursorView == null) {
+            // cursor hidden: stay ready for the next time it is shown
+            cursorCalibrated = false
+            calibCount = 0
+            calibSumYaw = 0f
+            calibSumPitch = 0f
+            lastStableX = screenW / 2f
+            lastStableY = screenH / 2f
+        } else if (havePose) {
             if (!cursorCalibrated) {
-                baseYaw = yawD
-                basePitch = pitchD
-                cursorCalibrated = true
-            } else {
-                var offYaw = yawD - baseYaw
+                if (!frozen) {
+                    calibSumYaw += yawF
+                    calibSumPitch += pitchF
+                    calibCount++
+                    if (calibCount >= CALIB_FRAMES) {
+                        baseYaw = calibSumYaw / calibCount
+                        basePitch = calibSumPitch / calibCount
+                        cursorCalibrated = true
+                    }
+                }
+            } else if (!frozen) {
+                var offYaw = yawF - baseYaw
                 if (MIRROR_CURSOR_X) offYaw = -offYaw
-                val offPitch = pitchD - basePitch
-                ui.post { moveCursor(offYaw, offPitch) }
+                val offPitch = pitchF - basePitch
+                val speed = cursorSpeed()
+                val offX = (deadZone(offYaw) * speed * screenW).coerceIn(-screenW / 2f, screenW / 2f)
+                val offY = (deadZone(offPitch) * speed * CURSOR_Y_GAIN * screenH).coerceIn(-screenH / 2f, screenH / 2f)
+                cursorX = screenW / 2f + offX
+                cursorY = screenH / 2f + offY
+                lastStableX = cursorX
+                lastStableY = cursorY
+                ui.post { applyCursor(offX, offY) }
             }
-        }
-
-        if (DEBUG && havePose && now - lastDebug > 2500) {
-            say("pitch=%.2f yaw=%.2f eyes=%s".format(pitchD, yawD, if (eyesClosed) "closed" else "open"))
-            lastDebug = now
         }
     }
 
@@ -422,16 +527,17 @@ class GestureService : LifecycleService() {
         }
         try {
             val wm = getSystemService(WINDOW_SERVICE) as WindowManager
-            val tv = TextView(this).apply {
-                text = "\u27A4" // ➤ arrow
-                textSize = 36f
-                setTextColor(Color.WHITE)
-                setShadowLayer(8f, 0f, 0f, Color.BLACK)
-                rotation = -45f
+            val dm = resources.displayMetrics
+            val size = (CURSOR_SIZE_DP * dm.density).toInt()
+            val dot = View(this)
+            dot.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(0x99FF3B30.toInt())
+                setStroke((3 * dm.density).toInt(), Color.WHITE)
             }
             val params = WindowManager.LayoutParams(
-                WindowManager.LayoutParams.WRAP_CONTENT,
-                WindowManager.LayoutParams.WRAP_CONTENT,
+                size,
+                size,
                 WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
                 WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
                     WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -442,14 +548,13 @@ class GestureService : LifecycleService() {
                 x = 0
                 y = 0
             }
-            wm.addView(tv, params)
+            wm.addView(dot, params)
             windowManager = wm
-            cursorView = tv
-            val dm = resources.displayMetrics
             cursorX = dm.widthPixels / 2f
             cursorY = dm.heightPixels / 2f
-            cursorCalibrated = false // next head-pose reading becomes the new "center" reference
-            if (DEBUG) say("Cursor shown (eyes closed 4s)")
+            cursorCalibrated = false // the next few head readings become the new "center"
+            cursorView = dot
+            if (DEBUG) say("Cursor shown - hold your head still for a moment")
         } catch (e: Exception) {
             Log.e(TAG, "Failed to show cursor", e)
             say("Couldn't show cursor: " + e.message)
@@ -468,33 +573,26 @@ class GestureService : LifecycleService() {
         }
         cursorView = null
         cursorCalibrated = false
-        if (DEBUG) say("Cursor hidden (eyes closed 4s)")
+        if (DEBUG) say("Cursor hidden")
     }
 
-    // Moves the cursor view based on how far the head has turned/tilted from its calibrated center.
-    private fun moveCursor(offsetYaw: Float, offsetPitch: Float) {
-        val tv = cursorView ?: return
+    // Moves the cursor dot to (screen center + offset).
+    private fun applyCursor(offX: Float, offY: Float) {
+        val v = cursorView ?: return
         val wm = windowManager ?: return
-        val dm = resources.displayMetrics
-        var offX = offsetYaw * CURSOR_SENSITIVITY * dm.widthPixels
-        var offY = offsetPitch * CURSOR_SENSITIVITY * dm.heightPixels
-        offX = offX.coerceIn(-dm.widthPixels / 2f, dm.widthPixels / 2f)
-        offY = offY.coerceIn(-dm.heightPixels / 2f, dm.heightPixels / 2f)
-        cursorX = dm.widthPixels / 2f + offX
-        cursorY = dm.heightPixels / 2f + offY
         try {
-            val params = tv.layoutParams as WindowManager.LayoutParams
+            val params = v.layoutParams as WindowManager.LayoutParams
             params.x = offX.toInt()
             params.y = offY.toInt()
-            wm.updateViewLayout(tv, params)
+            wm.updateViewLayout(v, params)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to move cursor", e)
         }
     }
 
-    private fun clickAtCursor() {
+    private fun clickAt(x: Float, y: Float) {
         if (DEBUG) say("CLICK")
-        SwipeAccessibilityService.tap(cursorX, cursorY)
+        SwipeAccessibilityService.tap(x, y)
     }
 
     override fun onDestroy() {
@@ -503,5 +601,46 @@ class GestureService : LifecycleService() {
         faceLandmarker?.close()
         executor.shutdown()
         super.onDestroy()
+    }
+}
+
+/**
+ * One-Euro filter: a low-lag smoothing filter. Heavy smoothing while the signal is nearly still
+ * (kills jitter), light smoothing while it moves fast (keeps the cursor responsive).
+ */
+class OneEuroFilter(private val minCutoff: () -> Float, private val beta: Float) {
+    private var xPrev = 0f
+    private var dxPrev = 0f
+    private var tPrev = 0L
+    private var ready = false
+
+    fun reset() {
+        ready = false
+    }
+
+    private fun alpha(cutoff: Float, dt: Float): Float {
+        val tau = 1f / (2f * Math.PI.toFloat() * cutoff)
+        return 1f / (1f + tau / dt)
+    }
+
+    fun filter(x: Float, tMs: Long): Float {
+        if (!ready) {
+            ready = true
+            xPrev = x
+            dxPrev = 0f
+            tPrev = tMs
+            return x
+        }
+        val dt = (tMs - tPrev).coerceAtLeast(1L) / 1000f
+        tPrev = tMs
+        val dx = (x - xPrev) / dt
+        val aD = alpha(1.0f, dt)
+        val dxHat = aD * dx + (1f - aD) * dxPrev
+        dxPrev = dxHat
+        val cutoff = minCutoff() + beta * abs(dxHat)
+        val a = alpha(cutoff, dt)
+        val xHat = a * x + (1f - a) * xPrev
+        xPrev = xHat
+        return xHat
     }
 }
