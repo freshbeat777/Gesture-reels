@@ -17,6 +17,10 @@ class SwipeAccessibilityService : AccessibilityService() {
         fun swipe(next: Boolean) {
             instance?.doSwipe(next)
         }
+
+        fun goBack() {
+            instance?.performGlobalAction(GLOBAL_ACTION_BACK)
+        }
     }
 
     override fun onServiceConnected() {

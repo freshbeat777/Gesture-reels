@@ -21,43 +21,47 @@ import androidx.lifecycle.LifecycleService
 import com.google.mediapipe.framework.image.BitmapImageBuilder
 import com.google.mediapipe.tasks.core.BaseOptions
 import com.google.mediapipe.tasks.vision.core.RunningMode
-import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
-import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
+import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarker
+import com.google.mediapipe.tasks.vision.facelandmarker.FaceLandmarkerResult
 import java.util.concurrent.Executors
 import kotlin.math.abs
-import kotlin.math.hypot
 
 class GestureService : LifecycleService() {
 
     companion object {
         private const val TAG = "GestureService"
         // --- Tuning knobs ---
-        private const val WINDOW_MS = 400L      // time window to measure a flick
-        private const val THRESH = 0.35f        // how far the fingertip must move (in palm lengths)
-        private const val COOLDOWN_MS = 400L    // minimum pause between swipes
-        private const val REARM_DELTA = 0.3f      // finger must curl back by this much to allow the next swipe
-        private const val REARM_TIMEOUT_MS = 1500L // ...or this much time must pass
-        private const val DEBUG = true            // show small status messages (set false to hide)
+        private const val WINDOW_MS = 400L         // time window to measure a nod/turn
+        private const val PITCH_THRESH = 0.12f      // how far the nose must move vertically (relative to face height) to count as a nod
+        private const val YAW_THRESH = 0.12f        // how far the nose must move horizontally (relative to face width) to count as a turn
+        private const val COOLDOWN_MS = 400L        // minimum pause between triggers
+        private const val REARM_DELTA = 0.06f       // must return this far back toward center before the next trigger is allowed
+        private const val REARM_TIMEOUT_MS = 1500L  // ...or this much time must pass
+        private const val DEBUG = true              // show small status messages (set false to hide)
+        // If "turn right" fires on a LEFT turn instead (or vice versa), flip this to true.
+        private const val MIRROR_YAW = false
     }
 
-    private var landmarker: HandLandmarker? = null
+    private var landmarker: FaceLandmarker? = null
     private val executor = Executors.newSingleThreadExecutor()
-    private val history = ArrayDeque<Pair<Long, Float>>()
-    private var lastTrigger = 0L
-    private var armed = true
-    private var extremeD = 0f
-    private var lastWasDown = false
+
+    // Pitch (nod up / nod down) state
+    private val pitchHistory = ArrayDeque<Pair<Long, Float>>()
+    private var pitchLastTrigger = 0L
+    private var pitchArmed = true
+    private var pitchExtreme = 0f
+    private var pitchLastWasDown = false
+
+    // Yaw (turn right -> back) state
+    private val yawHistory = ArrayDeque<Pair<Long, Float>>()
+    private var yawLastTrigger = 0L
+    private var yawArmed = true
+    private var yawExtreme = 0f
+
     private var lastDebug = 0L
     private val ui = Handler(Looper.getMainLooper())
     private var toast: Toast? = null
-    private var handSeen = false
-    private var lastReport = 0L
-    @Volatile private var maxMove = 0f
-    @Volatile private var frames = 0
-    @Volatile private var results = 0
-    @Volatile private var imgW = 1f
-    @Volatile private var imgH = 1f
-    @Volatile private var rotation = 0
+    private var faceSeen = false
 
     override fun onCreate() {
         super.onCreate()
@@ -90,13 +94,13 @@ class GestureService : LifecycleService() {
     }
 
     private fun setupLandmarker() {
-        val base = BaseOptions.builder().setModelAssetPath("hand_landmarker.task").build()
-        val opts = HandLandmarker.HandLandmarkerOptions.builder()
+        val base = BaseOptions.builder().setModelAssetPath("face_landmarker.task").build()
+        val opts = FaceLandmarker.FaceLandmarkerOptions.builder()
             .setBaseOptions(base)
             .setRunningMode(RunningMode.LIVE_STREAM)
-            .setNumHands(1)
-            .setMinHandDetectionConfidence(0.3f)
-            .setMinHandPresenceConfidence(0.3f)
+            .setNumFaces(1)
+            .setMinFaceDetectionConfidence(0.3f)
+            .setMinFacePresenceConfidence(0.3f)
             .setMinTrackingConfidence(0.3f)
             .setResultListener { result, _ -> onResult(result) }
             .setErrorListener { e ->
@@ -105,7 +109,7 @@ class GestureService : LifecycleService() {
             }
             .build()
         try {
-            landmarker = HandLandmarker.createFromOptions(this, opts)
+            landmarker = FaceLandmarker.createFromOptions(this, opts)
         } catch (e: Exception) {
             Log.e(TAG, "Model load failed", e)
             say("Model load failed: " + e.message)
@@ -130,14 +134,10 @@ class GestureService : LifecycleService() {
         try {
             val lm = landmarker ?: return
             val bmp = proxy.toBitmap()
-            rotation = proxy.imageInfo.rotationDegrees
+            val rotation = proxy.imageInfo.rotationDegrees
             val m = Matrix().apply { postRotate(rotation.toFloat()) }
             val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
-            imgW = rotated.width.toFloat()
-            imgH = rotated.height.toFloat()
-            frames++
             val now = SystemClock.uptimeMillis()
-
             lm.detectAsync(BitmapImageBuilder(rotated).build(), now)
         } catch (e: Exception) {
             Log.e(TAG, "analyze failed", e)
@@ -147,72 +147,107 @@ class GestureService : LifecycleService() {
         }
     }
 
-    private fun onResult(result: HandLandmarkerResult) {
-        results++
-        val hand = result.landmarks().firstOrNull()
+    private fun onResult(result: FaceLandmarkerResult) {
+        val face = result.faceLandmarks().firstOrNull()
         val now = SystemClock.uptimeMillis()
-        if (hand == null) {
-            if (handSeen && DEBUG) say("Hand lost")
-            handSeen = false
-            history.clear()
+        if (face == null) {
+            if (faceSeen && DEBUG) say("Face lost")
+            faceSeen = false
+            pitchHistory.clear()
+            yawHistory.clear()
             return
         }
-        if (!handSeen && DEBUG) say("Hand detected")
-        handSeen = true
-        val w = imgW
-        val h = imgH
-        // 0 = wrist, 9 = middle knuckle, 5 = index knuckle, 8 = index fingertip
-        val palm = hypot(
-            (hand[9].x() - hand[0].x()) * w,
-            (hand[9].y() - hand[0].y()) * h
-        )
-        if (palm < 1f) return
+        if (!faceSeen && DEBUG) say("Face detected")
+        faceSeen = true
 
-        // How far the fingertip is above(-) / below(+) its knuckle, in palm lengths
-        val d = (hand[8].y() - hand[5].y()) * h / palm
+        // 1 = nose tip, 10 = forehead, 152 = chin, 234 = right cheek, 454 = left cheek
+        val nose = face[1]
+        val forehead = face[10]
+        val chin = face[152]
+        val rightCheek = face[234]
+        val leftCheek = face[454]
 
-        history.addLast(now to d)
-        while (history.isNotEmpty() && now - history.first().first > WINDOW_MS) history.removeFirst()
-        val delta = d - history.first().second
-        if (abs(delta) > maxMove) maxMove = abs(delta)
+        val faceH = abs(chin.y() - forehead.y())
+        val faceW = abs(leftCheek.x() - rightCheek.x())
+        if (faceH < 0.01f || faceW < 0.01f) return
 
-        // After a flick, wait for the finger to return from that same direction before allowing another trigger.
+        // Nose's vertical position relative to the face's vertical center, normalized by face height
+        val pitchD = (nose.y() - (forehead.y() + chin.y()) / 2f) / faceH
+        pitchHistory.addLast(now to pitchD)
+        while (pitchHistory.isNotEmpty() && now - pitchHistory.first().first > WINDOW_MS) pitchHistory.removeFirst()
+        val pitchDelta = pitchD - pitchHistory.first().second
+
+        // Nose's horizontal position relative to the face's horizontal center, normalized by face width
+        var yawD = (nose.x() - (leftCheek.x() + rightCheek.x()) / 2f) / faceW
+        if (MIRROR_YAW) yawD = -yawD
+        yawHistory.addLast(now to yawD)
+        while (yawHistory.isNotEmpty() && now - yawHistory.first().first > WINDOW_MS) yawHistory.removeFirst()
+        val yawDelta = yawD - yawHistory.first().second
+
         if (DEBUG && now - lastDebug > 2500) {
-            say("d=%.2f move=%.2f armed=%b".format(d, maxMove, armed))
-            maxMove = 0f
+            say("pitch=%.2f yaw=%.2f".format(pitchD, yawD))
             lastDebug = now
         }
-        if (!armed) {
-            if (lastWasDown) {
-                // last trigger was a DOWN flick; wait for the finger to curl back UP
-                if (d > extremeD) extremeD = d
-                if (extremeD - d > REARM_DELTA || now - lastTrigger > REARM_TIMEOUT_MS) {
-                    armed = true
-                    history.clear()
+
+        handlePitch(pitchD, pitchDelta, now)
+        handleYaw(yawD, yawDelta, now)
+    }
+
+    private fun handlePitch(d: Float, delta: Float, now: Long) {
+        if (!pitchArmed) {
+            if (pitchLastWasDown) {
+                // last trigger was a nod DOWN; wait for it to return back up toward center
+                if (d > pitchExtreme) pitchExtreme = d
+                if (pitchExtreme - d > REARM_DELTA || now - pitchLastTrigger > REARM_TIMEOUT_MS) {
+                    pitchArmed = true
+                    pitchHistory.clear()
                 }
             } else {
-                // last trigger was an UP flick; wait for the finger to curl back DOWN
-                if (d < extremeD) extremeD = d
-                if (d - extremeD > REARM_DELTA || now - lastTrigger > REARM_TIMEOUT_MS) {
-                    armed = true
-                    history.clear()
+                // last trigger was a nod UP; wait for it to return back down toward center
+                if (d < pitchExtreme) pitchExtreme = d
+                if (d - pitchExtreme > REARM_DELTA || now - pitchLastTrigger > REARM_TIMEOUT_MS) {
+                    pitchArmed = true
+                    pitchHistory.clear()
                 }
             }
             return
         }
-        if (now - lastTrigger < COOLDOWN_MS || history.size < 2) return
-        if (delta < -THRESH) fire(true, now, d)         // finger flicked up -> next reel
-        else if (delta > THRESH) fire(false, now, d)    // finger flicked down -> previous reel
+        if (now - pitchLastTrigger < COOLDOWN_MS || pitchHistory.size < 2) return
+        if (delta < -PITCH_THRESH) firePitch(true, now, d)        // nod up -> next reel
+        else if (delta > PITCH_THRESH) firePitch(false, now, d)   // nod down -> previous reel
     }
 
-    private fun fire(next: Boolean, now: Long, d: Float) {
-        lastTrigger = now
-        armed = false
-        lastWasDown = !next
-        extremeD = d
-        history.clear()
-        if (DEBUG) say(if (next) "NEXT" else "PREVIOUS")
+    private fun firePitch(next: Boolean, now: Long, d: Float) {
+        pitchLastTrigger = now
+        pitchArmed = false
+        pitchLastWasDown = !next
+        pitchExtreme = d
+        pitchHistory.clear()
+        if (DEBUG) say(if (next) "NEXT (nod up)" else "PREVIOUS (nod down)")
         SwipeAccessibilityService.swipe(next)
+    }
+
+    private fun handleYaw(d: Float, delta: Float, now: Long) {
+        if (!yawArmed) {
+            // last trigger was a turn RIGHT; wait for it to return back toward center
+            if (d > yawExtreme) yawExtreme = d
+            if (yawExtreme - d > REARM_DELTA || now - yawLastTrigger > REARM_TIMEOUT_MS) {
+                yawArmed = true
+                yawHistory.clear()
+            }
+            return
+        }
+        if (now - yawLastTrigger < COOLDOWN_MS || yawHistory.size < 2) return
+        if (delta > YAW_THRESH) fireYaw(now, d)   // turn right -> back
+    }
+
+    private fun fireYaw(now: Long, d: Float) {
+        yawLastTrigger = now
+        yawArmed = false
+        yawExtreme = d
+        yawHistory.clear()
+        if (DEBUG) say("BACK (turn right)")
+        SwipeAccessibilityService.goBack()
     }
 
     override fun onDestroy() {
