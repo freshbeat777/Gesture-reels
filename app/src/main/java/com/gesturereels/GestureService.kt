@@ -68,7 +68,7 @@ class GestureService : LifecycleService() {
         // Higher = more sensitive / cursor moves farther for the same head motion.
         private const val CURSOR_SENSITIVITY = 3.0f
         // If moving your head left moves the cursor right (or vice versa), flip this to true.
-        private const val MIRROR_CURSOR_X = false
+        private const val MIRROR_CURSOR_X = true
 
         // --- Performance ---
         private const val MAX_DIM = 480        // longest edge (px) fed to the ML models; smaller = faster
