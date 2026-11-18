@@ -51,7 +51,7 @@ class GestureService : LifecycleService() {
         // A finger counts as "extended" when its tip sits at least this many times
         // farther from the wrist than its middle (PIP) joint.
         private const val EXTENDED_RATIO = 1.0f
-        private const val OPEN_FINGER_COUNT = 3   // this many extended fingers (of 4) = palm open
+        private const val OPEN_FINGER_COUNT = 4   // this many extended fingers (of 4) = palm open
         private const val CLOSED_FINGER_COUNT = 1 // this many or fewer extended = fist / closed, resets the arming
 
         // --- Eyes closed -> toggle cursor ---
@@ -69,6 +69,10 @@ class GestureService : LifecycleService() {
         private const val CURSOR_SENSITIVITY = 3.0f
         // If moving your head left moves the cursor right (or vice versa), flip this to true.
         private const val MIRROR_CURSOR_X = false
+
+        // --- Performance ---
+        private const val MAX_DIM = 480        // longest edge (px) fed to the ML models; smaller = faster
+        private const val FACE_INTERVAL_MS = 100L // ~10fps cap on the face model (hand still runs every frame)
 
         private const val DEBUG = true // show small status messages (set false to hide)
     }
@@ -201,6 +205,8 @@ class GestureService : LifecycleService() {
         }, ContextCompat.getMainExecutor(this))
     }
 
+    private var lastFaceRun = 0L
+
     private fun analyze(proxy: ImageProxy) {
         try {
             val hl = handLandmarker
@@ -209,13 +215,32 @@ class GestureService : LifecycleService() {
             val bmp = proxy.toBitmap()
             val rotation = proxy.imageInfo.rotationDegrees
             val m = Matrix().apply { postRotate(rotation.toFloat()) }
-            val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+            var rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
+
+            // Downscale — the models don't need full camera resolution, and this is the single
+            // biggest cost per frame. Keeps aspect ratio, caps the long edge at MAX_DIM.
+            val longEdge = maxOf(rotated.width, rotated.height)
+            if (longEdge > MAX_DIM) {
+                val scale = MAX_DIM.toFloat() / longEdge
+                val w = (rotated.width * scale).toInt().coerceAtLeast(1)
+                val h = (rotated.height * scale).toInt().coerceAtLeast(1)
+                rotated = Bitmap.createScaledBitmap(rotated, w, h, true)
+            }
+
             imgW = rotated.width.toFloat()
             imgH = rotated.height.toFloat()
             val now = SystemClock.uptimeMillis()
             val mpImage = BitmapImageBuilder(rotated).build()
+
+            // Hand runs every frame (finger flicks are quick and need full responsiveness).
             hl?.detectAsync(mpImage, now)
-            fl?.detectAsync(mpImage, now)
+
+            // Face only needs to run often enough to catch a blink or a 4-second hold —
+            // throttling it to ~10fps cuts a large chunk of per-frame cost without hurting accuracy.
+            if (fl != null && now - lastFaceRun >= FACE_INTERVAL_MS) {
+                lastFaceRun = now
+                fl.detectAsync(mpImage, now)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "analyze failed", e)
             say("analyze error: " + e.message)
@@ -250,6 +275,7 @@ class GestureService : LifecycleService() {
         while (fingerHistory.isNotEmpty() && now - fingerHistory.first().first > FINGER_WINDOW_MS) fingerHistory.removeFirst()
         val delta = d - fingerHistory.first().second
 
+        var fingerFiredThisFrame = false
         if (!fingerArmed) {
             if (d < fingerMinD) fingerMinD = d
             if (d - fingerMinD > FINGER_REARM_DELTA || now - fingerLastTrigger > FINGER_REARM_TIMEOUT_MS) {
@@ -257,10 +283,23 @@ class GestureService : LifecycleService() {
                 fingerHistory.clear()
             }
         } else if (now - fingerLastTrigger >= FINGER_COOLDOWN_MS && fingerHistory.size >= 2) {
-            if (delta < -FINGER_THRESH) fireFinger(now)
+            if (delta < -FINGER_THRESH) {
+                fireFinger(now)
+                fingerFiredThisFrame = true
+            }
         }
 
         // ---- Palm open -> previous reel / palm closed -> no action, just resets arming ----
+        // Skip entirely this frame (and briefly after) if the finger gesture just fired, so a
+        // single flick that also spreads the other fingers can't ALSO register as an open palm.
+        if (fingerFiredThisFrame || now - fingerLastTrigger < 400L) {
+            if (DEBUG && now - lastDebug > 2500) {
+                say("finger flick active, skipping palm check")
+                lastDebug = now
+            }
+            return
+        }
+
         // A finger counts as "extended" when its tip sits farther from the wrist than its middle (PIP) joint.
         val fingerJoints = arrayOf(6 to 8, 10 to 12, 14 to 16, 18 to 20) // (PIP, TIP) for index/middle/ring/pinky
         var extendedCount = 0
