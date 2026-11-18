@@ -11,10 +11,11 @@ jobs:
         with:
           distribution: temurin
           java-version: 17
-      - name: Download face model
+      - name: Download face + hand models
         run: |
           mkdir -p app/src/main/assets
           curl -L -o app/src/main/assets/face_landmarker.task https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task
+          curl -L -o app/src/main/assets/hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
       - uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: "8.7"
