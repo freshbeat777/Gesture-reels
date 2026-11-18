@@ -3,7 +3,6 @@ package com.gesturereels
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.content.ContentValues
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Matrix
@@ -11,7 +10,6 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
-import android.provider.MediaStore
 import android.util.Log
 import android.widget.Toast
 import androidx.camera.core.CameraSelector
@@ -36,13 +34,20 @@ class GestureService : LifecycleService() {
         // --- Tuning knobs ---
         private const val WINDOW_MS = 400L      // time window to measure a flick
         private const val THRESH = 0.35f        // how far the fingertip must move (in palm lengths)
-        private const val COOLDOWN_MS = 900L    // pause after a swipe (ignores the return motion)
+        private const val COOLDOWN_MS = 400L    // minimum pause between swipes
+        private const val HAND_WINDOW_MS = 500L   // time window for a whole-hand swipe
+        private const val HAND_THRESH = 0.9f      // how far the hand must move down (in palm lengths)
+        private const val HAND_COOLDOWN_MS = 900L // pause after a hand swipe
+        private const val REARM_D = -0.3f       // finger must curl back below this to allow the next swipe
     }
 
     private var landmarker: HandLandmarker? = null
     private val executor = Executors.newSingleThreadExecutor()
     private val history = ArrayDeque<Pair<Long, Float>>()
     private var lastTrigger = 0L
+    private var armed = true
+    private val handHistory = ArrayDeque<Pair<Long, Float>>()
+    private var lastHandTrigger = 0L
     private val ui = Handler(Looper.getMainLooper())
     private var toast: Toast? = null
     private var handSeen = false
@@ -133,13 +138,6 @@ class GestureService : LifecycleService() {
             frames++
             val now = SystemClock.uptimeMillis()
 
-            if (frames == 60 || frames == 180 || frames == 360) saveDebug(rotated)
-
-            if (now - lastReport > 2500) {
-                say("f=$frames r=$results ${rotated.width}x${rotated.height} rot=$rotation hand=$handSeen move=%.2f".format(maxMove))
-                maxMove = 0f
-                lastReport = now
-            }
             lm.detectAsync(BitmapImageBuilder(rotated).build(), now)
         } catch (e: Exception) {
             Log.e(TAG, "analyze failed", e)
@@ -149,31 +147,17 @@ class GestureService : LifecycleService() {
         }
     }
 
-    private fun saveDebug(bmp: Bitmap) {
-        try {
-            val cv = ContentValues().apply {
-                put(MediaStore.Images.Media.DISPLAY_NAME, "gesture_debug_${System.currentTimeMillis()}.jpg")
-                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
-                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/GestureReels")
-            }
-            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv) ?: return
-            contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.JPEG, 85, it) }
-            say("Saved debug photo")
-        } catch (e: Exception) {
-            say("Save failed: " + e.message)
-        }
-    }
-
     private fun onResult(result: HandLandmarkerResult) {
         results++
         val hand = result.landmarks().firstOrNull()
         val now = SystemClock.uptimeMillis()
         if (hand == null) {
-            if (handSeen) { handSeen = false; say("Hand lost") }
+            handSeen = false
             history.clear()
+            handHistory.clear()
             return
         }
-        if (!handSeen) { handSeen = true; say("Hand detected") }
+        handSeen = true
         val w = imgW
         val h = imgH
         // 0 = wrist, 9 = middle knuckle, 5 = index knuckle, 8 = index fingertip
@@ -182,6 +166,19 @@ class GestureService : LifecycleService() {
             (hand[9].y() - hand[0].y()) * h
         )
         if (palm < 1f) return
+        // Whole-hand swipe down -> previous reel
+        val cy = (hand[0].y() + hand[5].y() + hand[9].y() + hand[17].y()) / 4f * h
+        handHistory.addLast(now to cy)
+        while (handHistory.isNotEmpty() && now - handHistory.first().first > HAND_WINDOW_MS) handHistory.removeFirst()
+        val handDy = (cy - handHistory.first().second) / palm
+        if (handDy > HAND_THRESH && now - lastHandTrigger > HAND_COOLDOWN_MS) {
+            lastHandTrigger = now
+            handHistory.clear()
+            history.clear()
+            SwipeAccessibilityService.swipe(false)
+            return
+        }
+
         // How far the fingertip is above(-) / below(+) its knuckle, in palm lengths
         val d = (hand[8].y() - hand[5].y()) * h / palm
 
@@ -190,15 +187,19 @@ class GestureService : LifecycleService() {
         val delta = d - history.first().second
         if (abs(delta) > maxMove) maxMove = abs(delta)
 
+        // After a swipe, wait for the finger to curl back down before allowing the next one.
+        if (!armed) {
+            if (d > REARM_D) { armed = true; history.clear() }
+            return
+        }
         if (now - lastTrigger < COOLDOWN_MS || history.size < 2) return
-        if (delta < -THRESH) fire(true, now)       // finger flicked up
-        else if (delta > THRESH) fire(false, now)  // finger flicked down
+        if (delta < -THRESH) fire(true, now)       // finger flicked up -> next reel
     }
 
     private fun fire(next: Boolean, now: Long) {
         lastTrigger = now
+        armed = false
         history.clear()
-        say(if (next) "NEXT" else "PREVIOUS")
         SwipeAccessibilityService.swipe(next)
     }
 
