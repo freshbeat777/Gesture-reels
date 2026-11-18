@@ -3,6 +3,7 @@ package com.gesturereels
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.ContentValues
 import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Matrix
@@ -10,6 +11,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import android.provider.MediaStore
 import android.util.Log
 import android.widget.Toast
 import androidx.camera.core.CameraSelector
@@ -33,7 +35,7 @@ class GestureService : LifecycleService() {
         private const val TAG = "GestureService"
         // --- Tuning knobs ---
         private const val WINDOW_MS = 400L      // time window to measure a flick
-        private const val THRESH = 0.35f         // how far the fingertip must move (in palm lengths)
+        private const val THRESH = 0.35f        // how far the fingertip must move (in palm lengths)
         private const val COOLDOWN_MS = 900L    // pause after a swipe (ignores the return motion)
     }
 
@@ -44,11 +46,13 @@ class GestureService : LifecycleService() {
     private val ui = Handler(Looper.getMainLooper())
     private var toast: Toast? = null
     private var handSeen = false
-    private var gotFrame = false
     private var lastReport = 0L
-    private var maxMove = 0f
+    @Volatile private var maxMove = 0f
+    @Volatile private var frames = 0
+    @Volatile private var results = 0
     @Volatile private var imgW = 1f
     @Volatile private var imgH = 1f
+    @Volatile private var rotation = 0
 
     override fun onCreate() {
         super.onCreate()
@@ -86,8 +90,14 @@ class GestureService : LifecycleService() {
             .setBaseOptions(base)
             .setRunningMode(RunningMode.LIVE_STREAM)
             .setNumHands(1)
+            .setMinHandDetectionConfidence(0.3f)
+            .setMinHandPresenceConfidence(0.3f)
+            .setMinTrackingConfidence(0.3f)
             .setResultListener { result, _ -> onResult(result) }
-            .setErrorListener { e -> Log.e(TAG, "MediaPipe error", e) }
+            .setErrorListener { e ->
+                Log.e(TAG, "MediaPipe error", e)
+                say("MediaPipe error: " + e.message)
+            }
             .build()
         try {
             landmarker = HandLandmarker.createFromOptions(this, opts)
@@ -114,21 +124,48 @@ class GestureService : LifecycleService() {
     private fun analyze(proxy: ImageProxy) {
         try {
             val lm = landmarker ?: return
-            if (!gotFrame) { gotFrame = true; say("Camera is working") }
             val bmp = proxy.toBitmap()
-            val m = Matrix().apply { postRotate(proxy.imageInfo.rotationDegrees.toFloat()) }
+            rotation = proxy.imageInfo.rotationDegrees
+            val m = Matrix().apply { postRotate(rotation.toFloat()) }
             val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
             imgW = rotated.width.toFloat()
             imgH = rotated.height.toFloat()
-            lm.detectAsync(BitmapImageBuilder(rotated).build(), SystemClock.uptimeMillis())
+            frames++
+            val now = SystemClock.uptimeMillis()
+
+            if (frames == 60 || frames == 180 || frames == 360) saveDebug(rotated)
+
+            if (now - lastReport > 2500) {
+                say("f=$frames r=$results ${rotated.width}x${rotated.height} rot=$rotation hand=$handSeen move=%.2f".format(maxMove))
+                maxMove = 0f
+                lastReport = now
+            }
+            lm.detectAsync(BitmapImageBuilder(rotated).build(), now)
         } catch (e: Exception) {
             Log.e(TAG, "analyze failed", e)
+            say("analyze error: " + e.message)
         } finally {
             proxy.close()
         }
     }
 
+    private fun saveDebug(bmp: Bitmap) {
+        try {
+            val cv = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, "gesture_debug_${System.currentTimeMillis()}.jpg")
+                put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg")
+                put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/GestureReels")
+            }
+            val uri = contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, cv) ?: return
+            contentResolver.openOutputStream(uri)?.use { bmp.compress(Bitmap.CompressFormat.JPEG, 85, it) }
+            say("Saved debug photo")
+        } catch (e: Exception) {
+            say("Save failed: " + e.message)
+        }
+    }
+
     private fun onResult(result: HandLandmarkerResult) {
+        results++
         val hand = result.landmarks().firstOrNull()
         val now = SystemClock.uptimeMillis()
         if (hand == null) {
@@ -151,13 +188,7 @@ class GestureService : LifecycleService() {
         history.addLast(now to d)
         while (history.isNotEmpty() && now - history.first().first > WINDOW_MS) history.removeFirst()
         val delta = d - history.first().second
-
         if (abs(delta) > maxMove) maxMove = abs(delta)
-        if (now - lastReport > 2000) {
-            say("move=%.2f (need %.2f)".format(maxMove, THRESH))
-            maxMove = 0f
-            lastReport = now
-        }
 
         if (now - lastTrigger < COOLDOWN_MS || history.size < 2) return
         if (delta < -THRESH) fire(true, now)       // finger flicked up
