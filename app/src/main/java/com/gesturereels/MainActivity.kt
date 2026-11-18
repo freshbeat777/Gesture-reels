@@ -6,11 +6,14 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.Settings
 import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
+import android.widget.Toast
 
 class MainActivity : Activity() {
 
@@ -28,6 +31,14 @@ class MainActivity : Activity() {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         })
         layout.addView(button("2. Start gesture control") { start() })
+        layout.addView(button("Test swipe (3 sec delay)") {
+            if (!SwipeAccessibilityService.isConnected()) {
+                Toast.makeText(this, "Accessibility service is OFF", Toast.LENGTH_LONG).show()
+            } else {
+                Toast.makeText(this, "Open Reels now...", Toast.LENGTH_SHORT).show()
+                Handler(Looper.getMainLooper()).postDelayed({ SwipeAccessibilityService.swipe(true) }, 3000)
+            }
+        })
         layout.addView(button("Stop") {
             stopService(Intent(this, GestureService::class.java))
         })

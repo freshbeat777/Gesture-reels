@@ -7,8 +7,11 @@ import android.content.pm.ServiceInfo
 import android.graphics.Bitmap
 import android.graphics.Matrix
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.widget.Toast
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
@@ -21,6 +24,7 @@ import com.google.mediapipe.tasks.vision.core.RunningMode
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarker
 import com.google.mediapipe.tasks.vision.handlandmarker.HandLandmarkerResult
 import java.util.concurrent.Executors
+import kotlin.math.abs
 import kotlin.math.hypot
 
 class GestureService : LifecycleService() {
@@ -28,8 +32,8 @@ class GestureService : LifecycleService() {
     companion object {
         private const val TAG = "GestureService"
         // --- Tuning knobs ---
-        private const val WINDOW_MS = 300L      // time window to measure a flick
-        private const val THRESH = 0.5f         // how far the fingertip must move (in palm lengths)
+        private const val WINDOW_MS = 400L      // time window to measure a flick
+        private const val THRESH = 0.35f         // how far the fingertip must move (in palm lengths)
         private const val COOLDOWN_MS = 900L    // pause after a swipe (ignores the return motion)
     }
 
@@ -37,6 +41,12 @@ class GestureService : LifecycleService() {
     private val executor = Executors.newSingleThreadExecutor()
     private val history = ArrayDeque<Pair<Long, Float>>()
     private var lastTrigger = 0L
+    private val ui = Handler(Looper.getMainLooper())
+    private var toast: Toast? = null
+    private var handSeen = false
+    private var gotFrame = false
+    private var lastReport = 0L
+    private var maxMove = 0f
     @Volatile private var imgW = 1f
     @Volatile private var imgH = 1f
 
@@ -45,6 +55,13 @@ class GestureService : LifecycleService() {
         startForegroundNotification()
         setupLandmarker()
         startCamera()
+    }
+
+    private fun say(msg: String) {
+        ui.post {
+            toast?.cancel()
+            toast = Toast.makeText(applicationContext, msg, Toast.LENGTH_SHORT).also { it.show() }
+        }
     }
 
     private fun startForegroundNotification() {
@@ -72,7 +89,12 @@ class GestureService : LifecycleService() {
             .setResultListener { result, _ -> onResult(result) }
             .setErrorListener { e -> Log.e(TAG, "MediaPipe error", e) }
             .build()
-        landmarker = HandLandmarker.createFromOptions(this, opts)
+        try {
+            landmarker = HandLandmarker.createFromOptions(this, opts)
+        } catch (e: Exception) {
+            Log.e(TAG, "Model load failed", e)
+            say("Model load failed: " + e.message)
+        }
     }
 
     private fun startCamera() {
@@ -92,6 +114,7 @@ class GestureService : LifecycleService() {
     private fun analyze(proxy: ImageProxy) {
         try {
             val lm = landmarker ?: return
+            if (!gotFrame) { gotFrame = true; say("Camera is working") }
             val bmp = proxy.toBitmap()
             val m = Matrix().apply { postRotate(proxy.imageInfo.rotationDegrees.toFloat()) }
             val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, true)
@@ -109,9 +132,11 @@ class GestureService : LifecycleService() {
         val hand = result.landmarks().firstOrNull()
         val now = SystemClock.uptimeMillis()
         if (hand == null) {
+            if (handSeen) { handSeen = false; say("Hand lost") }
             history.clear()
             return
         }
+        if (!handSeen) { handSeen = true; say("Hand detected") }
         val w = imgW
         val h = imgH
         // 0 = wrist, 9 = middle knuckle, 5 = index knuckle, 8 = index fingertip
@@ -125,9 +150,16 @@ class GestureService : LifecycleService() {
 
         history.addLast(now to d)
         while (history.isNotEmpty() && now - history.first().first > WINDOW_MS) history.removeFirst()
-        if (now - lastTrigger < COOLDOWN_MS || history.size < 2) return
-
         val delta = d - history.first().second
+
+        if (abs(delta) > maxMove) maxMove = abs(delta)
+        if (now - lastReport > 2000) {
+            say("move=%.2f (need %.2f)".format(maxMove, THRESH))
+            maxMove = 0f
+            lastReport = now
+        }
+
+        if (now - lastTrigger < COOLDOWN_MS || history.size < 2) return
         if (delta < -THRESH) fire(true, now)       // finger flicked up
         else if (delta > THRESH) fire(false, now)  // finger flicked down
     }
@@ -135,6 +167,7 @@ class GestureService : LifecycleService() {
     private fun fire(next: Boolean, now: Long) {
         lastTrigger = now
         history.clear()
+        say(if (next) "NEXT" else "PREVIOUS")
         SwipeAccessibilityService.swipe(next)
     }
 

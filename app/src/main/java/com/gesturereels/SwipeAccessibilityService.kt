@@ -12,6 +12,8 @@ class SwipeAccessibilityService : AccessibilityService() {
         @Volatile
         private var instance: SwipeAccessibilityService? = null
 
+        fun isConnected() = instance != null
+
         fun swipe(next: Boolean) {
             instance?.doSwipe(next)
         }
