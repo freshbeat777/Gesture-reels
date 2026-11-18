@@ -24,13 +24,23 @@ class MainActivity : Activity() {
             setPadding(48, 96, 48, 48)
         }
         layout.addView(TextView(this).apply {
-            text = "Flick index finger UP = next reel\nFlick DOWN = previous reel"
+            text = "Flick finger UP = next reel\nOpen palm = previous reel\n" +
+                "Close eyes 4 sec = show/hide cursor\n" +
+                "Move head = move cursor, blink twice = click"
             textSize = 18f
         })
         layout.addView(button("1. Enable accessibility service") {
             startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
         })
-        layout.addView(button("2. Start gesture control") { start() })
+        layout.addView(button("2. Allow cursor overlay") {
+            if (!Settings.canDrawOverlays(this)) {
+                startActivity(Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    android.net.Uri.parse("package:$packageName")))
+            } else {
+                Toast.makeText(this, "Already allowed", Toast.LENGTH_SHORT).show()
+            }
+        })
+        layout.addView(button("3. Start gesture control") { start() })
         layout.addView(button("Test swipe (3 sec delay)") {
             if (!SwipeAccessibilityService.isConnected()) {
                 Toast.makeText(this, "Accessibility service is OFF", Toast.LENGTH_LONG).show()

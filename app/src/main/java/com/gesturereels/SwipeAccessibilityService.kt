@@ -18,8 +18,8 @@ class SwipeAccessibilityService : AccessibilityService() {
             instance?.doSwipe(next)
         }
 
-        fun goBack() {
-            instance?.performGlobalAction(GLOBAL_ACTION_BACK)
+        fun tap(x: Float, y: Float) {
+            instance?.doTap(x, y)
         }
     }
 
@@ -48,6 +48,14 @@ class SwipeAccessibilityService : AccessibilityService() {
         }
         val gesture = GestureDescription.Builder()
             .addStroke(GestureDescription.StrokeDescription(path, 0, 200))
+            .build()
+        dispatchGesture(gesture, null, null)
+    }
+
+    private fun doTap(x: Float, y: Float) {
+        val path = Path().apply { moveTo(x, y) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0, 60))
             .build()
         dispatchGesture(gesture, null, null)
     }
