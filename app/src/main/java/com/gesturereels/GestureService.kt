@@ -38,7 +38,9 @@ class GestureService : LifecycleService() {
         private const val HAND_WINDOW_MS = 500L   // time window for a whole-hand swipe
         private const val HAND_THRESH = 0.9f      // how far the hand must move down (in palm lengths)
         private const val HAND_COOLDOWN_MS = 900L // pause after a hand swipe
-        private const val REARM_D = -0.3f       // finger must curl back below this to allow the next swipe
+        private const val REARM_DELTA = 0.3f      // finger must curl back down by this much to allow the next swipe
+        private const val REARM_TIMEOUT_MS = 1500L // ...or this much time must pass
+        private const val DEBUG = true            // show small status messages (set false to hide)
     }
 
     private var landmarker: HandLandmarker? = null
@@ -46,6 +48,8 @@ class GestureService : LifecycleService() {
     private val history = ArrayDeque<Pair<Long, Float>>()
     private var lastTrigger = 0L
     private var armed = true
+    private var minD = 10f
+    private var lastDebug = 0L
     private val handHistory = ArrayDeque<Pair<Long, Float>>()
     private var lastHandTrigger = 0L
     private val ui = Handler(Looper.getMainLooper())
@@ -152,11 +156,13 @@ class GestureService : LifecycleService() {
         val hand = result.landmarks().firstOrNull()
         val now = SystemClock.uptimeMillis()
         if (hand == null) {
+            if (handSeen && DEBUG) say("Hand lost")
             handSeen = false
             history.clear()
             handHistory.clear()
             return
         }
+        if (!handSeen && DEBUG) say("Hand detected")
         handSeen = true
         val w = imgW
         val h = imgH
@@ -175,6 +181,7 @@ class GestureService : LifecycleService() {
             lastHandTrigger = now
             handHistory.clear()
             history.clear()
+            if (DEBUG) say("PREVIOUS (hand down)")
             SwipeAccessibilityService.swipe(false)
             return
         }
@@ -188,8 +195,17 @@ class GestureService : LifecycleService() {
         if (abs(delta) > maxMove) maxMove = abs(delta)
 
         // After a swipe, wait for the finger to curl back down before allowing the next one.
+        if (DEBUG && now - lastDebug > 2500) {
+            say("d=%.2f move=%.2f armed=%b".format(d, maxMove, armed))
+            maxMove = 0f
+            lastDebug = now
+        }
         if (!armed) {
-            if (d > REARM_D) { armed = true; history.clear() }
+            if (d < minD) minD = d
+            if (d - minD > REARM_DELTA || now - lastTrigger > REARM_TIMEOUT_MS) {
+                armed = true
+                history.clear()
+            }
             return
         }
         if (now - lastTrigger < COOLDOWN_MS || history.size < 2) return
@@ -199,7 +215,9 @@ class GestureService : LifecycleService() {
     private fun fire(next: Boolean, now: Long) {
         lastTrigger = now
         armed = false
+        minD = 10f
         history.clear()
+        if (DEBUG) say("NEXT")
         SwipeAccessibilityService.swipe(next)
     }
 
